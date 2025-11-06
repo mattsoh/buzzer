@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Buzzer — Host</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+  <div class="container">
+    <h2>Quiz Buzzer — Host</h2>
+
+    <div id="authArea" class="panel">
+      <label for="adminPwd">Admin password</label>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <input id="adminPwd" type="password" placeholder="Password" />
+        <button id="authBtn" class="btn">Enter the stage</button>
+      </div>
+      <div id="authMsg" class="small"></div>
+    </div>
+
+    <div id="dash" class="hidden">
+      <div class="admin-top panel">
+        <input id="questionInput" class="question-input" placeholder="Type the question text players will see" />
+        <button id="startBtn" class="btn">Start Buzz</button>
+      </div>
+
+      <div class="panel" style="margin-top:12px">
+        <div id="liveQuestion" class="small">(no question)</div>
+        <div id="winnerArea" class="winner-display idle" style="margin-top:10px">No one yet — waiting for a buzz</div>
+      </div>
+
+      <div class="row">
+        <div style="flex:1" class="panel">
+          <h4>Players</h4>
+          <div id="players" class="players-list"></div>
+        </div>
+
+        <div style="width:360px" class="panel">
+          <h4>Leaderboard</h4>
+          <div id="leaderboard" class="players-list"></div>
+          <h4 style="margin-top:12px">Buzzes (this round)</h4>
+          <div id="buzzList" class="players-list"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const socket = io();
+    const ADMIN_PWD = document.getElementById('adminPwd');
+    const authBtn = document.getElementById('authBtn');
+    const authMsg = document.getElementById('authMsg');
+    const dash = document.getElementById('dash');
+    const playersDiv = document.getElementById('players');
+  const startBtn = document.getElementById('startBtn');
+  const questionInput = document.getElementById('questionInput');
+  const liveQuestion = document.getElementById('liveQuestion');
+  const winnerArea = document.getElementById('winnerArea');
+
+    authBtn.addEventListener('click', ()=>{
+      socket.emit('admin:auth', ADMIN_PWD.value);
+    });
+
+    // allow Enter in the question input to start the round (convenience)
+    questionInput.addEventListener('keydown', (e)=>{
+      if (e.key === 'Enter') { startBtn.click(); }
+    });
+
+    // storage helpers with cookie fallback
+    function setStored(key, val) {
+      try { localStorage.setItem(key, val); } catch (e) {
+        document.cookie = key + '=' + encodeURIComponent(val) + ';max-age=' + (60*60*24*7) + ';path=/';
+      }
+    }
+    function getStored(key) {
+      try { return localStorage.getItem(key); } catch (e) {
+        const m = document.cookie.match(new RegExp('(^| )' + key + '=([^;]+)'));
+        return m ? decodeURIComponent(m[2]) : null;
+      }
+    }
+    function removeStored(key) {
+      try { localStorage.removeItem(key); } catch (e) { document.cookie = key + '=;max-age=0;path=/'; }
+    }
+
+    // try token-based admin restore
+    const savedAdminToken = getStored('adminToken');
+    if (savedAdminToken) {
+      socket.emit('admin:authToken', savedAdminToken);
+    }
+
+    // allow Enter on admin password to submit
+    ADMIN_PWD.addEventListener('keydown', (e) => { if (e.key === 'Enter') authBtn.click(); });
+
+    socket.on('admin:auth:ok', (payload)=>{
+      const token = payload && payload.token;
+      if (token) setStored('adminToken', token);
+      document.getElementById('authArea').classList.add('hidden');
+      dash.classList.remove('hidden');
+      authMsg.textContent='';
+    });
+    socket.on('admin:auth:fail', ()=>{ authMsg.textContent='Bad password'; });
+
+    function requestPlayerList(){ socket.emit('noop'); /* trigger nothing; server pushes updates */ }
+
+    socket.on('admin:playerList', ({ players, currentQuestion: q, isBuzzingActive, winnerId, buzzOrder })=>{
+      playersDiv.innerHTML='';
+      players.forEach(p=>{
+        const row = document.createElement('div'); row.className='player-row';
+        row.setAttribute('data-id', p.id);
+        const left = document.createElement('div');
+        // status pill
+        const status = p.approved ? '<span class="status-pill">Approved</span>' : '<span class="small">Pending</span>';
+        left.innerHTML = `<div class="player-name">${p.name} ${status}</div>`;
+        const right = document.createElement('div'); right.className='player-actions';
+        if (!p.approved){
+          const approve = document.createElement('button'); approve.textContent='Approve'; approve.className='btn';
+          approve.onclick = ()=>{ socket.emit('admin:approve', { id: p.id }); };
+          right.appendChild(approve);
+        }
+        const kick = document.createElement('button'); kick.textContent='Kick'; kick.className='btn secondary';
+        kick.onclick = ()=>{ socket.emit('admin:kick', { id: p.id }); };
+        right.appendChild(kick);
+        row.appendChild(left); row.appendChild(right);
+        playersDiv.appendChild(row);
+      });
+
+      // question
+      liveQuestion.textContent = q || '(none)';
+
+      // winner
+      if (!winnerId) {
+        winnerArea.className='winner-display idle';
+        winnerArea.textContent='No one yet — waiting for a buzz';
+      }
+
+      // leaderboard (only approved players, sorted by points desc)
+      const lb = players.filter(p => p.approved).slice().sort((a,b)=>b.points - a.points);
+      const lbDiv = document.getElementById('leaderboard'); lbDiv.innerHTML='';
+      lb.forEach(p=>{
+        const r = document.createElement('div'); r.className='player-row';
+        r.innerHTML = `<div class="player-name">${p.name}</div><div class="status-pill">${p.points} pts</div>`;
+        lbDiv.appendChild(r);
+      });
+
+      // buzz list
+      const buzzDiv = document.getElementById('buzzList'); buzzDiv.innerHTML='';
+      if (buzzOrder && buzzOrder.length>0){
+        buzzOrder.forEach((b, idx)=>{
+          const who = players.find(x=>x.id===b.id && x.approved);
+          if (!who) return; // skip unapproved or missing players
+          const r = document.createElement('div'); r.className='player-row';
+          r.innerHTML = `<div>${idx+1}. ${who.name}</div><div class="small">+${(b.time/1000).toFixed(3)}s</div>`;
+          buzzDiv.appendChild(r);
+        });
+      }
+    });
+
+    socket.on('round:starting', ({ question, startTime })=>{
+      liveQuestion.textContent = question || '(none)';
+      winnerArea.className='winner-display idle';
+      winnerArea.textContent = 'Buzzers unlocking...';
+      // schedule unlock and play beep on host only
+      const ms = startTime - Date.now();
+      setTimeout(()=>{
+        winnerArea.textContent = 'Buzzers unlocked — good luck!';
+        playBeep();
+      }, Math.max(0, ms));
+    });
+
+    socket.on('round:ended', ({ winnerName, winnerTime })=>{
+      if (winnerName) {
+        winnerArea.className='winner-display win';
+        winnerArea.textContent = `First to buzz: ${winnerName} — +${(winnerTime/1000).toFixed(3)}s`;
+      } else {
+        winnerArea.className='winner-display idle';
+        winnerArea.textContent = 'No valid buzzes';
+      }
+      // buzz list will be refreshed via admin:playerList shortly
+    });
+
+    socket.on('round:reset', ()=>{
+      liveQuestion.textContent='(none)';
+      winnerArea.className='winner-display idle';
+      winnerArea.textContent='No one yet — waiting for a buzz';
+    });
+
+    startBtn.addEventListener('click', ()=>{
+      const q = questionInput.value || '';
+      socket.emit('admin:start', { question: q });
+    });
+  // next button removed — admin can start next round by changing question and clicking Start Buzz
+
+    function playBeep(){
+      try{
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.type='sine'; o.frequency.value = 880;
+        g.gain.setValueAtTime(0.0001, ctx.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime + 0.01);
+        o.connect(g); g.connect(ctx.destination);
+        o.start();
+        setTimeout(()=>{ o.stop(); ctx.close(); }, 180);
+      }catch(e){ }
+    }
+
+    // initial request for list once authed
+    socket.on('connect', ()=>{});
+  </script>
+</body>
+</html>

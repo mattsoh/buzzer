@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Buzzer Player</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+  <div class="container">
+    <h2>Buzzer</h2>
+
+    <div id="joinPanel" class="panel player-screen">
+      <input id="nameInput" placeholder="Your name" />
+      <button id="joinBtn" class="btn">Join</button>
+      <div id="joinStatus" class="status">Not joined</div>
+    </div>
+
+  <div id="playPanel" class="panel player-screen hidden">
+      <div id="qText" class="small">Waiting for question...</div>
+      <div id="approvedPill" class="status small">Approved</div>
+      <button id="buzzer" class="buzzer locked">Buzzer</button>
+      <div id="hint" class="small">Click buzzer or press Space</div>
+      <div id="roundInfo" class="status">Locked</div>
+      <div id="result" class="small"></div>
+    </div>
+  </div>
+
+  <script>
+    const socket = io();
+    const nameInput = document.getElementById('nameInput');
+    const joinBtn = document.getElementById('joinBtn');
+    const joinStatus = document.getElementById('joinStatus');
+    const playPanel = document.getElementById('playPanel');
+    const joinPanel = document.getElementById('joinPanel');
+    const buzzer = document.getElementById('buzzer');
+    const roundInfo = document.getElementById('roundInfo');
+    const qText = document.getElementById('qText');
+    const result = document.getElementById('result');
+
+    let approved = false;
+    let unlocked = false;
+    let startTime = null;
+
+    joinBtn.addEventListener('click', ()=>{
+      const name = nameInput.value.trim() || 'Anonymous';
+      socket.emit('player:join', name);
+      joinStatus.textContent = 'Join request sent — waiting approval';
+      // hide inputs so the player knows they're in (pending)
+      nameInput.classList.add('hidden');
+      joinBtn.classList.add('hidden');
+      // show a small pending pill
+      const pending = document.createElement('div'); pending.className='small'; pending.textContent='Pending approval...';
+      pending.id = 'pendingPill';
+      joinPanel.appendChild(pending);
+    });
+
+    // storage helpers (cookie fallback)
+    function setStored(key, val) {
+      try { localStorage.setItem(key, val); } catch (e) {
+        document.cookie = key + '=' + encodeURIComponent(val) + ';max-age=' + (60*60*24*7) + ';path=/';
+      }
+    }
+    function getStored(key) {
+      try { return localStorage.getItem(key); } catch (e) {
+        const m = document.cookie.match(new RegExp('(^| )' + key + '=([^;]+)'));
+        return m ? decodeURIComponent(m[2]) : null;
+      }
+    }
+    function removeStored(key) {
+      try { localStorage.removeItem(key); } catch (e) { document.cookie = key + '=;max-age=0;path=/'; }
+    }
+
+    // restore session if we have a stored player id
+    const storedId = getStored('playerId');
+    if (storedId) {
+      joinStatus.textContent = 'Restoring session...';
+      // hide join controls while we try to reconnect
+      nameInput.classList.add('hidden');
+      joinBtn.classList.add('hidden');
+      socket.emit('player:reconnect', { id: storedId });
+    }
+
+    // allow Enter to submit join
+    nameInput.addEventListener('keydown', (e)=>{
+      if (e.key === 'Enter') { joinBtn.click(); }
+    });
+
+    socket.on('player:approved', ()=>{
+      approved = true;
+      // remove pending indicator if present
+      const pending = document.getElementById('pendingPill'); if (pending) pending.remove();
+      // hide join inputs and show play area
+      nameInput.classList.add('hidden');
+      joinBtn.classList.add('hidden');
+      joinStatus.textContent = 'Approved — ready to play';
+      joinPanel.classList.add('hidden');
+      playPanel.classList.remove('hidden');
+      roundInfo.textContent = 'Waiting for the host';
+      // if a round already started and time has passed, enable buzzer for this newly-approved player
+      if (startTime && Date.now() >= startTime) {
+        unlocked = true; buzzer.classList.remove('locked'); roundInfo.textContent = 'Buzzers unlocked — click buzzer or press Space!';
+      }
+    });
+
+    // server tells us our playerId when we first join
+    socket.on('player:joined', ({ id }) => {
+      try{ setStored('playerId', id); }catch(e){}
+    });
+
+    socket.on('player:reconnected', ({ id, approved: wasApproved }) => {
+      // store id and reflect approval state
+      try{ setStored('playerId', id); }catch(e){}
+      if (wasApproved) {
+        // behave like approved
+        approved = true;
+        const pending = document.getElementById('pendingPill'); if (pending) pending.remove();
+        joinStatus.textContent = 'Restored — approved';
+        joinPanel.classList.add('hidden');
+        playPanel.classList.remove('hidden');
+      } else {
+        joinStatus.textContent = 'Restored — pending approval';
+      }
+    });
+
+    socket.on('player:kicked', ()=>{
+      // hide everything and remove stored id
+      try{ localStorage.removeItem('playerId'); }catch(e){}
+      joinStatus.textContent = 'You were kicked';
+      // hide panels and show kicked message
+      joinPanel.classList.remove('hidden');
+      playPanel.classList.add('hidden');
+      const pending = document.getElementById('pendingPill'); if (pending) pending.remove();
+      nameInput.classList.remove('hidden'); joinBtn.classList.remove('hidden');
+    });
+
+    socket.on('round:starting', ({ question, startTime: sTime })=>{
+      qText.textContent = question || '(no question)';
+      result.textContent = '';
+      startTime = sTime;
+      // don't show a live countdown; just tell users to get ready and unlock when time arrives
+      roundInfo.textContent = 'Get ready...';
+      const delay = Math.max(0, startTime - Date.now());
+      setTimeout(()=>{
+        // only unlock for approved players
+        if (approved) {
+          unlocked = true; buzzer.classList.remove('locked'); roundInfo.textContent = 'Buzzers unlocked — click buzzer or press Space!';
+        } else {
+          roundInfo.textContent = 'Pending approval — wait for host';
+        }
+      }, delay);
+    });
+
+    // allow Enter to buzz when unlocked and Space to buzz
+    document.addEventListener('keydown', (e)=>{
+      if (e.key === 'Enter') {
+        if (!approved) return;
+        if (!unlocked) return;
+        buzzer.click();
+      }
+      if (e.code === 'Space' || e.key === ' ' || e.key === 'Spacebar') {
+        // prevent scrolling
+        e.preventDefault();
+        if (!approved) return;
+        if (!unlocked) return;
+        buzzer.click();
+      }
+    });
+
+    buzzer.addEventListener('click', ()=>{
+      if (!approved) return;
+      if (!unlocked) return;
+      // disable immediately to avoid duplicate clicks
+      unlocked = false; buzzer.classList.add('locked'); roundInfo.textContent = 'Buzzed — waiting...';
+      socket.emit('player:buzz');
+    });
+
+    socket.on('round:ended', ({ winnerId, winnerName, winnerTime, times })=>{
+      const myId = getStored('playerId');
+      const myTime = times && myId && times[myId] != null ? times[myId] : null;
+      if (winnerId === myId) {
+        result.textContent = `You were first! +${(winnerTime/1000).toFixed(3)}s`;
+      } else if (myTime != null) {
+        const behind = myTime - winnerTime;
+        result.textContent = `First to buzz: ${winnerName} (+${(winnerTime/1000).toFixed(3)}s). You were +${(behind/1000).toFixed(3)}s behind.`;
+      } else {
+        result.textContent = `First to buzz: ${winnerName} (+${(winnerTime/1000).toFixed(3)}s). You did not buzz.`;
+      }
+      // flash winner highlight briefly
+      flashWinner(winnerName);
+      roundInfo.textContent = 'Round ended';
+      unlocked = false; buzzer.classList.add('locked');
+    });
+
+    socket.on('round:reset', ()=>{
+      qText.textContent = 'Waiting for question...';
+      result.textContent = '';
+      roundInfo.textContent = 'Locked';
+      unlocked = false; buzzer.classList.add('locked');
+    });
+
+    function flashWinner(name){
+      const orig = buzzer.style.boxShadow;
+      document.body.style.background = '#eaffef';
+      setTimeout(()=>{ document.body.style.background=''; }, 700);
+    }
+
+    // players do not play the unlock beep; host does
+  </script>
+</body>
+</html>
